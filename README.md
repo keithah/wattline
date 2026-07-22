@@ -10,6 +10,8 @@ Wattline is an iPhone, iPad, and Mac companion for compatible power devices.
 4. Choose it under **Nearby devices**.
 5. Use the dashboard to view live power and port status.
 
+![Wattline welcome screen with a Connect a device button](docs/images/onboarding.png)
+
 ## Bluetooth is the everyday connection
 
 Wattline connects directly to your power device over Bluetooth Low Energy.
@@ -21,13 +23,14 @@ you do not see your device under **Nearby devices**, make sure Bluetooth is
 enabled, the power station is on and close by, and then return to **Connect a
 device** to scan again.
 
+![Wattline Devices screen looking for nearby power devices](docs/images/nearby-devices.png)
+
+![Wattline demo dashboard showing power-device status](docs/images/dashboard.png)
+
+The dashboard screenshot uses Wattline's built-in Demo Mode, so every displayed
+reading is generated demo data rather than a physical measurement.
+
 ## Screenshots
-
-![Wattline onboarding screen inviting the owner to connect a device](docs/images/onboarding.png)
-
-![Wattline nearby-devices screen showing discoverable devices without personal identifiers](docs/images/nearby-devices.png)
-
-![Wattline dashboard showing live power and port status without personal identifiers](docs/images/dashboard.png)
 
 For the reproducible capture procedure, see [the screenshot guide](docs/screenshots.md).
 

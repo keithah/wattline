@@ -1,8 +1,9 @@
 ## Reproducible screenshot capture
 
 Refresh the public screenshots from a clean, named disposable simulator so the
-images are consistent and contain no personal data. The screenshots are not
-created by this guide; capture them when the app state is ready for review.
+images are consistent and contain no personal data. The checked-in dashboard
+uses the app's built-in Demo Mode; its readings are generated demo data, not
+physical measurements.
 
 1. In Xcode, create or select a disposable simulator with a clear name such as
    `Wattline Docs Capture`. Do not use a simulator that contains a personal
@@ -29,7 +30,7 @@ Capture these three images:
 | --- | --- |
 | `docs/images/onboarding.png` | The initial connection screen, with **Connect a device** and **Try Demo Mode** visible. |
 | `docs/images/nearby-devices.png` | The discovery screen, with **Nearby devices** visible and only demo or redacted device details. |
-| `docs/images/dashboard.png` | The connected or demo dashboard, showing live power and port status without personal identifiers. |
+| `docs/images/dashboard.png` | The Demo Mode dashboard, with the **DEMO** badge visible and no physical readings or personal identifiers implied. |
 
 ## Documentation acceptance check
 
