@@ -1,4 +1,4 @@
-## Reproducible screenshot capture
+# Reproducible screenshot capture
 
 Refresh the public screenshots from a clean, named disposable simulator so the
 images are consistent and contain no personal data. The checked-in dashboard
