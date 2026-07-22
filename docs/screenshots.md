@@ -36,7 +36,7 @@ Capture these three images:
 
 1. **Yes.** Quick Start begins with **Connect a device**, and the following section identifies Bluetooth Low Energy as Wattline's everyday, direct connection.
 2. **Yes.** Quick Start says to allow Bluetooth access and then choose the power station under **Nearby devices**; the discovery capture shows the scanning state.
-3. **Yes.** The Bluetooth section and troubleshooting steps say to enable Bluetooth, keep the power station on and nearby, then return to **Connect a device** to scan again.
+3. **Yes.** The Bluetooth section and troubleshooting steps direct an owner to the **Devices** screen, where they can wait for scanning or pull down to refresh; the Bluetooth-access explanation offers **Open Settings** when permission needs attention.
 4. **Yes.** The later Optional router access section explicitly says BLE is everyday, router access is optional, and it is not required for Bluetooth discovery or normal nearby use.
 
 ## Documentation acceptance check

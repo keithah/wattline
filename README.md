@@ -20,8 +20,8 @@ nearby device.
 
 Bluetooth permission lets Wattline look for compatible devices in range. If
 you do not see your device under **Nearby devices**, make sure Bluetooth is
-enabled, the power station is on and close by, and then return to **Connect a
-device** to scan again.
+enabled, the power station is on and close by, then return to the **Devices**
+screen. Wait for scanning to resume or pull down to refresh it.
 
 ![Wattline Devices screen looking for nearby power devices](docs/images/nearby-devices.png)
 
@@ -36,10 +36,12 @@ For the reproducible capture procedure, see [the screenshot guide](docs/screensh
 
 ## Troubleshooting
 
-- **Bluetooth access was denied:** Enable Bluetooth access for Wattline in your
-  device settings, then reopen the app and choose **Connect a device**.
-- **No device appears:** Keep the power station switched on and nearby, confirm
-  Bluetooth is enabled, and scan again from **Connect a device**.
+- **Bluetooth access was denied:** On the **Devices** screen, choose **Open
+  Settings** when Wattline shows its Bluetooth-access explanation. Enable
+  Bluetooth access for Wattline, then return to the app.
+- **No device appears:** On the **Devices** screen, keep the power station
+  switched on and nearby, confirm Bluetooth is enabled, then wait for scanning
+  or pull down to refresh.
 - **Need a safe tour first:** Choose **Try Demo Mode** from the connection
   screen to explore the app without connecting hardware.
 - **A connected device stops updating:** Move closer to the power station and
@@ -59,7 +61,18 @@ here as a deployed or validated connection path.
 
 ## Development
 
-Open the Wattline project in Xcode, select the **Wattline** scheme, and run it
-on an iPhone, iPad, Mac, or simulator. Use **Try Demo Mode** when you need a
-repeatable UI tour without a nearby power device. Follow the [screenshot
+Open the Wattline project in Xcode. Select **Wattline** for an iPhone, iPad, or
+iOS Simulator, or **WattlineMac** for macOS. Use **Try Demo Mode** when you
+need a repeatable UI tour without a nearby power device. Follow the [screenshot
 guide](docs/screenshots.md) when refreshing the images above.
+
+To verify the project and its Swift packages, run the relevant Xcode command
+(replace the iOS simulator placeholder with an installed destination), then:
+
+```bash
+xcodebuild test -project Wattline/Wattline.xcodeproj -scheme Wattline -destination 'platform=iOS Simulator,name=<installed iPhone simulator>' CODE_SIGNING_ALLOWED=NO
+xcodebuild test -project Wattline/Wattline.xcodeproj -scheme WattlineMac -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO
+swift test --package-path WattlineCore
+swift test --package-path WattlineUI
+swift test --package-path WattlineNetwork
+```
