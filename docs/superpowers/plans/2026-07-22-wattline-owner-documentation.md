@@ -141,15 +141,14 @@ Run:
 
 ```bash
 DEVICE_MODEL="${DEVICE_MODEL:-iPhone 17 Pro}"
-IOS_RUNTIME="${IOS_RUNTIME:-$(xcrun simctl list runtimes iOS -j | jq -r '.runtimes[-1].identifier')}"
-SIMULATOR_UDID=$(xcrun simctl create "Wattline Docs" "$DEVICE_MODEL" "$IOS_RUNTIME")
+SIMULATOR_UDID=$(xcrun simctl create "Wattline Docs" "$DEVICE_MODEL")
 echo "Created simulator: $SIMULATOR_UDID"
 xcodebuild build -project Wattline/Wattline.xcodeproj -scheme Wattline \
   -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" CODE_SIGNING_ALLOWED=NO
 ```
 
-Expected: the build exits 0. The UDID is captured in `$SIMULATOR_UDID` and
-consistently passed to subsequent xcodebuild and screenshot steps.
+Expected: `simctl` selects the newest compatible installed runtime and the
+build exits 0. Record the printed UDID for the subsequent screenshot steps.
 
 - [ ] **Step 2: Capture the onboarding screen**
 
@@ -157,7 +156,7 @@ Boot the simulator, launch the app in its first-run state, inspect the screen,
 and capture the visible **Connect a device** onboarding state:
 
 ```bash
-xcrun simctl io "$SIMULATOR_UDID" screenshot docs/images/onboarding.png
+xcrun simctl io <SIMULATOR_UDID> screenshot docs/images/onboarding.png
 ```
 
 Expected: no account, router, or device identifier is visible.
@@ -169,8 +168,8 @@ nearby-device empty/discovery state and the connected dashboard as two
 separate screenshots:
 
 ```bash
-xcrun simctl io "$SIMULATOR_UDID" screenshot docs/images/nearby-devices.png
-xcrun simctl io "$SIMULATOR_UDID" screenshot docs/images/dashboard.png
+xcrun simctl io <SIMULATOR_UDID> screenshot docs/images/nearby-devices.png
+xcrun simctl io <SIMULATOR_UDID> screenshot docs/images/dashboard.png
 ```
 
 Expected: the screenshots demonstrate discovery and the post-connect value
