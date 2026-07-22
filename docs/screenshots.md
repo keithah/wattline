@@ -29,7 +29,7 @@ Capture these three images:
 | File | Required app state |
 | --- | --- |
 | `docs/images/onboarding.png` | The initial connection screen, with **Connect a device** and **Try Demo Mode** visible. |
-| `docs/images/nearby-devices.png` | The discovery screen, with **Nearby devices** visible and only demo or redacted device details. |
+| `docs/images/nearby-devices.png` | The discovery screen, showing the **Devices** title and **Looking for Wattline devices** scanning state, with only demo or redacted device details. |
 | `docs/images/dashboard.png` | The Demo Mode dashboard, with the **DEMO** badge visible and no physical readings or personal identifiers implied. |
 
 ## Cold-read record
