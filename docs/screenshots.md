@@ -32,10 +32,17 @@ Capture these three images:
 | `docs/images/nearby-devices.png` | The discovery screen, with **Nearby devices** visible and only demo or redacted device details. |
 | `docs/images/dashboard.png` | The Demo Mode dashboard, with the **DEMO** badge visible and no physical readings or personal identifiers implied. |
 
+## Cold-read record
+
+1. **Yes.** Quick Start begins with **Connect a device**, and the following section identifies Bluetooth Low Energy as Wattline's everyday, direct connection.
+2. **Yes.** Quick Start says to allow Bluetooth access and then choose the power station under **Nearby devices**; the discovery capture shows the scanning state.
+3. **Yes.** The Bluetooth section and troubleshooting steps say to enable Bluetooth, keep the power station on and nearby, then return to **Connect a device** to scan again.
+4. **Yes.** The later Optional router access section explicitly says BLE is everyday, router access is optional, and it is not required for Bluetooth discovery or normal nearby use.
+
 ## Documentation acceptance check
 
-- [ ] A first-time owner can follow Quick Start without a router.
-- [ ] Bluetooth permission and nearby-device discovery are explained.
-- [ ] The README distinguishes optional OpenWrt/wattlined access from BLE.
-- [ ] Every image has descriptive alt text and no sensitive identifiers.
-- [ ] The companion repository link resolves.
+- [x] A first-time owner can follow Quick Start without a router.
+- [x] Bluetooth permission and nearby-device discovery are explained.
+- [x] The README distinguishes optional OpenWrt/wattlined access from BLE.
+- [x] Every image has descriptive alt text and no sensitive identifiers.
+- [x] The companion repository link resolves.
