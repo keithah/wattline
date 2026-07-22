@@ -121,6 +121,67 @@ final class PreferredRouterRouteTests: XCTestCase {
         XCTAssertEqual(selected, .remote)
     }
 
+    func testRemoteSessionExpiryRetriesLANAndSelectsLocal() async throws {
+        let lan = ScriptedPreferredHTTPClient(results: [
+            .failure(URLError(.cannotConnectToHost)),
+            .success(Self.okResponse()),
+        ])
+        let remote = ScriptedPreferredHTTPClient(results: [
+            .success(Self.okResponse()),
+            .failure(NetworkError.goodCloudSessionExpired),
+        ])
+        let route = PreferredRouterRoute(
+            lanHTTP: lan,
+            lanEvents: ScriptedPreferredEventStream(scripts: []),
+            remoteHTTP: remote,
+            remoteEvents: ScriptedPreferredEventStream(scripts: [])
+        )
+        let client = PreferredRouterHTTPClient(route: route)
+
+        _ = try await client.get("/api/v1/status", token: "wattline-token")
+        _ = try await client.get("/api/v1/status", token: "wattline-token")
+
+        let lanCallCount = await lan.callCount
+        let remoteCallCount = await remote.callCount
+        let selected = await route.selected
+        XCTAssertEqual(lanCallCount, 2)
+        XCTAssertEqual(remoteCallCount, 2)
+        XCTAssertEqual(selected, .local)
+    }
+
+    func testRemoteSessionExpiryDoesNotRetryDeadRemoteWhenLANIsUnreachable() async {
+        let lan = ScriptedPreferredHTTPClient(results: [
+            .failure(URLError(.cannotConnectToHost)),
+            .failure(URLError(.cannotConnectToHost)),
+        ])
+        let remote = ScriptedPreferredHTTPClient(results: [
+            .success(Self.okResponse()),
+            .failure(NetworkError.goodCloudSessionExpired),
+        ])
+        let route = PreferredRouterRoute(
+            lanHTTP: lan,
+            lanEvents: ScriptedPreferredEventStream(scripts: []),
+            remoteHTTP: remote,
+            remoteEvents: ScriptedPreferredEventStream(scripts: [])
+        )
+        let client = PreferredRouterHTTPClient(route: route)
+
+        do {
+            _ = try await client.get("/api/v1/status", token: "wattline-token")
+            _ = try await client.get("/api/v1/status", token: "wattline-token")
+            XCTFail("expected LAN reachability failure")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .cannotConnectToHost)
+        }
+
+        let lanCallCount = await lan.callCount
+        let remoteCallCount = await remote.callCount
+        let selected = await route.selected
+        XCTAssertEqual(lanCallCount, 2)
+        XCTAssertEqual(remoteCallCount, 2)
+        XCTAssertEqual(selected, .local)
+    }
+
     func testOlderLANSuccessCannotUndoNewerRemoteSelection() async throws {
         let lan = SuspendedPreferredHTTPClient()
         let remote = ScriptedPreferredHTTPClient(results: [

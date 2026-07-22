@@ -110,6 +110,7 @@ final class MacAppModel {
         routerConnections = services.connections
         routerAdministration = services.administration
         goodCloudSettings = services.goodCloudSettings
+        Task { await services.goodCloudSettings.load() }
         routerServicesGeneration &+= 1
     }
 }

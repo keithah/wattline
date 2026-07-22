@@ -341,6 +341,7 @@ final class AppModel {
         knownDevices = persistence.loadKnownDevices()
 
         Task {
+            await self.routerConnections.reloadSavedHosts(refreshGoodCloudRemoteAccess: false)
             if onboardingComplete {
                 await self.selectReturningSessionGoodCloudHost()
             }

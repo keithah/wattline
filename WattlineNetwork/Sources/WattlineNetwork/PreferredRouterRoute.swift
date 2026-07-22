@@ -27,6 +27,13 @@ enum RouterRouteFallbackPolicy {
         }
         return false
     }
+
+    static func permitsLocalRetry(afterRemoteError error: Error) -> Bool {
+        guard !Task.isCancelled, !(error is CancellationError) else {
+            return false
+        }
+        return error as? NetworkError == .goodCloudSessionExpired
+    }
 }
 
 public actor PreferredRouterRoute {
@@ -56,10 +63,20 @@ public actor PreferredRouterRoute {
         body: Data?,
         token: String
     ) async throws -> (Data, HTTPURLResponse) {
-        if selected == .remote {
-            return try await remoteHTTP.request(method, path, body: body, token: token)
-        }
         let requestGeneration = selectionGeneration
+        if selected == .remote {
+            do {
+                return try await remoteHTTP.request(method, path, body: body, token: token)
+            } catch {
+                guard RouterRouteFallbackPolicy.permitsLocalRetry(afterRemoteError: error) else {
+                    throw error
+                }
+                if selectionGeneration == requestGeneration {
+                    select(.local)
+                }
+                return try await lanHTTP.request(method, path, body: body, token: token)
+            }
+        }
 
         do {
             let result = try await lanHTTP.request(method, path, body: body, token: token)
