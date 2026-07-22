@@ -76,3 +76,8 @@ swift test --package-path WattlineCore
 swift test --package-path WattlineUI
 swift test --package-path WattlineNetwork
 ```
+
+## License
+
+Wattline is licensed under the [GNU Affero General Public License, version 3
+or later](LICENSE).
