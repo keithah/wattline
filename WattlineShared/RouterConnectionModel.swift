@@ -54,6 +54,63 @@ enum RouterClientCredentialAvailability: Equatable, Sendable {
     case unknown
 }
 
+final class GoodCloudAdministrationHTTPRegistry: @unchecked Sendable {
+    typealias DirectFactory = @Sendable (RouterEndpoint) throws -> any RouterHTTPClient
+    typealias PreferredFactory = @Sendable (
+        RouterEndpoint,
+        GoodCloudAssociation,
+        any GoodCloudRelayProvisioning
+    ) throws -> any RouterHTTPClient
+
+    private struct Configuration: Sendable {
+        let association: GoodCloudAssociation
+        let provisioner: any GoodCloudRelayProvisioning
+    }
+
+    private let lock = NSLock()
+    private let directFactory: DirectFactory
+    private let preferredFactory: PreferredFactory
+    private var configurationsByEndpointID: [UUID: Configuration] = [:]
+
+    init(
+        directFactory: @escaping DirectFactory,
+        preferredFactory: @escaping PreferredFactory
+    ) {
+        self.directFactory = directFactory
+        self.preferredFactory = preferredFactory
+    }
+
+    func update(
+        hosts: [RouterHostMetadata],
+        associations: [GoodCloudAssociation],
+        provisioner: (any GoodCloudRelayProvisioning)?
+    ) {
+        guard let provisioner else {
+            lock.withLock { configurationsByEndpointID = [:] }
+            return
+        }
+        let endpointsByHostID = Dictionary(uniqueKeysWithValues: hosts.map { ($0.id, $0.endpoint) })
+        let configurations = Dictionary(uniqueKeysWithValues: associations.compactMap { association in
+            endpointsByHostID[association.hostID].map {
+                ($0.peripheralID, Configuration(association: association, provisioner: provisioner))
+            }
+        })
+        lock.withLock { configurationsByEndpointID = configurations }
+    }
+
+    func client(for endpoint: RouterEndpoint) throws -> any RouterHTTPClient {
+        let configuration = lock.withLock { configurationsByEndpointID[endpoint.peripheralID] }
+        guard let configuration else {
+            return try directFactory(endpoint)
+        }
+        return try preferredFactory(
+            endpoint,
+            configuration.association,
+            configuration.provisioner
+        )
+    }
+}
+
 @MainActor
 @Observable
 final class RouterConnectionModel {
@@ -70,6 +127,29 @@ final class RouterConnectionModel {
         _ endpoint: RouterEndpoint
     ) throws -> RouterEnrollmentClient
     typealias TLSPromotionHTTPFactory = RouterTLSPinPromoter.HTTPFactory
+    struct GoodCloudAccountDependencies: Sendable {
+        let account: any GoodCloudAccountServing
+        let provisioner: any GoodCloudRelayProvisioning
+
+        init(
+            account: any GoodCloudAccountServing,
+            provisioner: any GoodCloudRelayProvisioning
+        ) {
+            self.account = account
+            self.provisioner = provisioner
+        }
+    }
+    struct GoodCloudRemoteAccessRouteSnapshot: Sendable {
+        let isAuthenticated: Bool
+        let associations: [GoodCloudAssociation]
+    }
+    typealias PreferredTransportFactory = @MainActor (
+        _ endpoint: RouterEndpoint,
+        _ credentials: any RouterCredentialProvider,
+        _ association: GoodCloudAssociation,
+        _ provisioner: any GoodCloudRelayProvisioning
+    ) throws -> any DeviceTransport
+    typealias GoodCloudAssociationLoader = @Sendable () async -> [GoodCloudAssociation]
 
     private(set) var savedHosts: [RouterHostMetadata] = []
     private(set) var discoveredRouters: [DiscoveredRouter] = []
@@ -87,6 +167,15 @@ final class RouterConnectionModel {
     private let tlsPinPromoter: RouterTLSPinPromoter
     private let enrollmentClientFactory: EnrollmentClientFactory
     private let transportFactory: TransportFactory
+    let administrationHTTPFactory: RouterAdministrationClient.HTTPFactory
+    let goodCloudAccount: GoodCloudAccountDependencies?
+    let goodCloudAssociations: GoodCloudAssociationStore?
+    private let goodCloudAssociationLoader: GoodCloudAssociationLoader?
+    private let preferredTransportFactory: PreferredTransportFactory?
+    private let goodCloudAdministrationHTTPRegistry: GoodCloudAdministrationHTTPRegistry?
+    private var goodCloudSessionIsAuthenticated = false
+    private var goodCloudAssociationsByHostID: [UUID: GoodCloudAssociation] = [:]
+    private var goodCloudRefreshGeneration: UInt64 = 0
 
     init(
         hostStore: RouterHostStore,
@@ -99,7 +188,15 @@ final class RouterConnectionModel {
             )
         },
         enrollmentClientFactory: @escaping EnrollmentClientFactory,
-        transportFactory: @escaping TransportFactory
+        transportFactory: @escaping TransportFactory,
+        goodCloudAccount: GoodCloudAccountDependencies? = nil,
+        goodCloudAssociations: GoodCloudAssociationStore? = nil,
+        goodCloudAssociationLoader: GoodCloudAssociationLoader? = nil,
+        preferredTransportFactory: PreferredTransportFactory? = nil,
+        administrationHTTPFactory: @escaping RouterAdministrationClient.HTTPFactory = {
+            try HTTPClient(endpoint: $0)
+        },
+        goodCloudAdministrationHTTPRegistry: GoodCloudAdministrationHTTPRegistry? = nil
     ) {
         self.hostStore = hostStore
         self.credentialStore = credentialStore
@@ -111,23 +208,64 @@ final class RouterConnectionModel {
         )
         self.enrollmentClientFactory = enrollmentClientFactory
         self.transportFactory = transportFactory
+        self.administrationHTTPFactory = administrationHTTPFactory
+        self.goodCloudAccount = goodCloudAccount
+        self.goodCloudAssociations = goodCloudAssociations
+        if let goodCloudAssociationLoader {
+            self.goodCloudAssociationLoader = goodCloudAssociationLoader
+        } else if let goodCloudAssociations {
+            self.goodCloudAssociationLoader = {
+                await goodCloudAssociations.allAssociations()
+            }
+        } else {
+            self.goodCloudAssociationLoader = nil
+        }
+        self.preferredTransportFactory = preferredTransportFactory
+        self.goodCloudAdministrationHTTPRegistry = goodCloudAdministrationHTTPRegistry
+        if let invalidationInstaller = goodCloudAccount?.account
+            as? any GoodCloudRemoteAccessInvalidationInstalling
+        {
+            invalidationInstaller.installRemoteAccessInvalidationHandler { [weak self] in
+                await self?.invalidateGoodCloudRemoteAccessRoute()
+            }
+        }
     }
 
-    static func production(defaults: UserDefaults = .standard) -> RouterConnectionModel {
+    static func production(
+        defaults: UserDefaults = .standard,
+        goodCloudAccountFactory: @MainActor () -> GoodCloudAccountDependencies = {
+            let service = GoodCloudAccountService.production()
+            return GoodCloudAccountDependencies(account: service, provisioner: service)
+        },
+        goodCloudAssociationStoreFactory: @MainActor () -> GoodCloudAssociationStore = {
+            GoodCloudAssociationStore()
+        },
+        directTransportFactory: TransportFactory? = nil,
+        preferredTransportFactory: PreferredTransportFactory? = nil
+    ) -> RouterConnectionModel {
         let hosts = RouterHostStore(backend: UserDefaultsRouterHostBackend(defaults: defaults))
         let credentials = RouterCredentialStore(backend: KeychainRouterCredentialBackend())
-        return RouterConnectionModel(
-            hostStore: hosts,
-            credentialStore: credentials,
-            discovery: RouterDiscovery(source: NWBrowserRouterDiscoverySource()),
-            enrollmentClientFactory: { endpoint in
+        let goodCloudAccount = goodCloudAccountFactory()
+        let goodCloudAssociations = goodCloudAssociationStoreFactory()
+        let administrationHTTPRegistry = GoodCloudAdministrationHTTPRegistry(
+            directFactory: { try HTTPClient(endpoint: $0) },
+            preferredFactory: { endpoint, association, provisioner in
                 let session = try RouterURLSessionFactory.make(endpoint: endpoint)
                 let baseURL = try RouterURLSessionFactory.baseURL(for: endpoint)
-                return RouterEnrollmentClient(
-                    httpClient: HTTPClient(baseURL: baseURL, session: session)
+                let coordinator = GoodCloudRelayCoordinator.production(
+                    deviceID: association.goodCloudDeviceID,
+                    provisioner: provisioner
                 )
+                let route = PreferredRouterRoute(
+                    lanHTTP: HTTPClient(baseURL: baseURL, session: session),
+                    lanEvents: SSEClient(baseURL: baseURL, session: session),
+                    remoteHTTP: RemoteRouterHTTPClient(coordinator: coordinator),
+                    remoteEvents: RemoteRouterEventStream(coordinator: coordinator)
+                )
+                return PreferredRouterHTTPClient(route: route)
             }
-        ) { endpoint, credentials in
+        )
+        let directTransportFactory = directTransportFactory ?? { endpoint, credentials in
             let session = try RouterURLSessionFactory.make(endpoint: endpoint)
             let baseURL = try RouterURLSessionFactory.baseURL(for: endpoint)
             return RouterTransport(
@@ -142,6 +280,52 @@ final class RouterConnectionModel {
                 )
             )
         }
+        let preferredTransportFactory = preferredTransportFactory ?? {
+            endpoint, credentials, association, provisioner in
+            let session = try RouterURLSessionFactory.make(endpoint: endpoint)
+            let baseURL = try RouterURLSessionFactory.baseURL(for: endpoint)
+            let coordinator = GoodCloudRelayCoordinator.production(
+                deviceID: association.goodCloudDeviceID,
+                provisioner: provisioner
+            )
+            let route = PreferredRouterRoute(
+                lanHTTP: HTTPClient(baseURL: baseURL, session: session),
+                lanEvents: SSEClient(baseURL: baseURL, session: session),
+                remoteHTTP: RemoteRouterHTTPClient(coordinator: coordinator),
+                remoteEvents: RemoteRouterEventStream(coordinator: coordinator)
+            )
+            return RouterTransport(
+                endpoint: endpoint,
+                accessLevel: .client,
+                credentials: credentials,
+                client: PreferredRouterHTTPClient(route: route),
+                events: PreferredRouterEventStream(route: route),
+                clock: SystemRouterConnectionClock(),
+                backoff: RouterReconnectBackoff(
+                    delays: [.seconds(1), .seconds(2), .seconds(5), .seconds(10)]
+                )
+            )
+        }
+        return RouterConnectionModel(
+            hostStore: hosts,
+            credentialStore: credentials,
+            discovery: RouterDiscovery(source: NWBrowserRouterDiscoverySource()),
+            enrollmentClientFactory: { endpoint in
+                let session = try RouterURLSessionFactory.make(endpoint: endpoint)
+                let baseURL = try RouterURLSessionFactory.baseURL(for: endpoint)
+                return RouterEnrollmentClient(
+                    httpClient: HTTPClient(baseURL: baseURL, session: session)
+                )
+            },
+            transportFactory: directTransportFactory,
+            goodCloudAccount: goodCloudAccount,
+            goodCloudAssociations: goodCloudAssociations,
+            preferredTransportFactory: preferredTransportFactory,
+            administrationHTTPFactory: { endpoint in
+                try administrationHTTPRegistry.client(for: endpoint)
+            },
+            goodCloudAdministrationHTTPRegistry: administrationHTTPRegistry
+        )
     }
 
     func startDiscovery() {
@@ -174,10 +358,113 @@ final class RouterConnectionModel {
         discoveryError = nil
     }
 
-    func reloadSavedHosts() async {
+    func reloadSavedHosts(refreshGoodCloudRemoteAccess shouldRefreshGoodCloud: Bool = true) async {
         savedHosts = await hostStore.hosts()
         await refreshClientCredentialAvailability(for: savedHosts)
+        if shouldRefreshGoodCloud {
+            await refreshGoodCloudRemoteAccess()
+        }
         loadError = nil
+    }
+
+    func savedHost(matchingDeviceMAC mac: String) async -> RouterHostMetadata? {
+        guard let normalizedMAC = DeviceIdentityDeduplicator.normalizedMAC(mac) else { return nil }
+        let hosts = await hostStore.hosts()
+        let matches = hosts.filter {
+            DeviceIdentityDeduplicator.normalizedMAC($0.deviceID) == normalizedMAC
+        }
+        guard matches.count == 1 else { return nil }
+        return matches[0]
+    }
+
+    @discardableResult
+    func refreshGoodCloudRemoteAccess() async -> Bool {
+        let generation = beginGoodCloudRemoteAccessUpdate()
+        guard let goodCloudAccount else {
+            return clearGoodCloudRemoteAccess(ifCurrent: generation)
+        }
+        let state = await goodCloudAccount.account.validateStoredSession()
+        return await publishGoodCloudRemoteAccess(state, generation: generation)
+    }
+
+    @discardableResult
+    func publishGoodCloudRemoteAccess(_ state: GoodCloudSessionState) async -> Bool {
+        let generation = beginGoodCloudRemoteAccessUpdate()
+        return await publishGoodCloudRemoteAccess(state, generation: generation)
+    }
+
+    func goodCloudRemoteAccessRouteSnapshot() -> GoodCloudRemoteAccessRouteSnapshot {
+        GoodCloudRemoteAccessRouteSnapshot(
+            isAuthenticated: goodCloudSessionIsAuthenticated,
+            associations: Array(goodCloudAssociationsByHostID.values)
+        )
+    }
+
+    @discardableResult
+    func publishGoodCloudRemoteAccess(_ snapshot: GoodCloudRemoteAccessRouteSnapshot) -> Bool {
+        let generation = beginGoodCloudRemoteAccessUpdate()
+        guard snapshot.isAuthenticated, let goodCloudAccount else {
+            return clearGoodCloudRemoteAccess(ifCurrent: generation)
+        }
+        guard goodCloudRefreshGeneration == generation else { return false }
+        goodCloudSessionIsAuthenticated = true
+        goodCloudAssociationsByHostID = Dictionary(uniqueKeysWithValues: snapshot.associations.map {
+            ($0.hostID, $0)
+        })
+        goodCloudAdministrationHTTPRegistry?.update(
+            hosts: savedHosts,
+            associations: snapshot.associations,
+            provisioner: goodCloudAccount.provisioner
+        )
+        return true
+    }
+
+    @discardableResult
+    func beginGoodCloudRemoteAccessUpdate() -> UInt64 {
+        goodCloudRefreshGeneration &+= 1
+        return goodCloudRefreshGeneration
+    }
+
+    private func publishGoodCloudRemoteAccess(
+        _ state: GoodCloudSessionState,
+        generation: UInt64
+    ) async -> Bool {
+        guard goodCloudRefreshGeneration == generation else { return false }
+        guard case .authenticated = state else {
+            return clearGoodCloudRemoteAccess(ifCurrent: generation)
+        }
+        guard let goodCloudAccount, let goodCloudAssociationLoader else {
+            return clearGoodCloudRemoteAccess(ifCurrent: generation)
+        }
+        let associations = await goodCloudAssociationLoader()
+        guard goodCloudRefreshGeneration == generation else { return false }
+        goodCloudSessionIsAuthenticated = true
+        goodCloudAssociationsByHostID = Dictionary(uniqueKeysWithValues: associations.map {
+            ($0.hostID, $0)
+        })
+        goodCloudAdministrationHTTPRegistry?.update(
+            hosts: savedHosts,
+            associations: associations,
+            provisioner: goodCloudAccount.provisioner
+        )
+        return true
+    }
+
+    private func clearGoodCloudRemoteAccess(ifCurrent generation: UInt64) -> Bool {
+        guard goodCloudRefreshGeneration == generation else { return false }
+        goodCloudSessionIsAuthenticated = false
+        goodCloudAssociationsByHostID = [:]
+        goodCloudAdministrationHTTPRegistry?.update(
+            hosts: savedHosts,
+            associations: [],
+            provisioner: nil
+        )
+        return true
+    }
+
+    private func invalidateGoodCloudRemoteAccessRoute() {
+        let generation = beginGoodCloudRemoteAccessUpdate()
+        _ = clearGoodCloudRemoteAccess(ifCurrent: generation)
     }
 
     @discardableResult
@@ -296,7 +583,19 @@ final class RouterConnectionModel {
     }
 
     func makeTransport(for host: RouterHostMetadata) throws -> any DeviceTransport {
-        try transportFactory(host.endpoint, credentialStore)
+        if goodCloudSessionIsAuthenticated,
+           let association = goodCloudAssociationsByHostID[host.id],
+           let goodCloudAccount,
+           let preferredTransportFactory
+        {
+            return try preferredTransportFactory(
+                host.endpoint,
+                credentialStore,
+                association,
+                goodCloudAccount.provisioner
+            )
+        }
+        return try transportFactory(host.endpoint, credentialStore)
     }
 
     func stageTLSCertificateFingerprint(
@@ -385,19 +684,22 @@ final class RouterConnectionModel {
         }
 
         for host in savedHosts {
-            let matchingIndex = records.firstIndex { record in
-                if let routerIdentity = routerIdentities[host.endpoint.peripheralID],
-                   let identity = record.identity,
-                   DeviceIdentityDeduplicator.merge(
-                       ble: identity,
-                       router: routerIdentity
-                   ) != nil {
-                    return true
+            let hostMAC = DeviceIdentityDeduplicator.normalizedMAC(host.deviceID)
+            let matchingIndex: Int?
+            if let hostMAC {
+                matchingIndex = uniqueSavedHost(matchingNormalizedMAC: hostMAC)?.id == host.id
+                    ? Self.uniqueRecordIndex(in: records, matchingNormalizedMAC: hostMAC)
+                    : nil
+            } else if let routerIdentity = routerIdentities[host.endpoint.peripheralID] {
+                matchingIndex = Self.uniqueRecordIndex(in: records) { record in
+                    guard let identity = record.identity else { return false }
+                    return DeviceIdentityDeduplicator.merge(
+                        ble: identity,
+                        router: routerIdentity
+                    ) != nil
                 }
-                guard let hostMAC = DeviceIdentityDeduplicator.normalizedMAC(host.deviceID),
-                      let deviceMAC = DeviceIdentityDeduplicator.normalizedMAC(record.identity?.macAddress)
-                else { return false }
-                return hostMAC == deviceMAC
+            } else {
+                matchingIndex = nil
             }
             if let matchingIndex {
                 let existing = records[matchingIndex]
@@ -447,11 +749,11 @@ final class RouterConnectionModel {
 
         for router in discoveredRouters {
             let routerIdentity = Self.snapshot(for: router)
-            let host = savedHosts.first { Self.matches($0, router: router) }
-            if let index = records.firstIndex(where: { record in
-                guard let identity = record.identity else { return false }
-                return DeviceIdentityDeduplicator.merge(ble: identity, router: routerIdentity) != nil
-            }) {
+            let host = uniqueSavedHost(matchingNormalizedMAC: router.deviceID)
+            if let index = Self.uniqueRecordIndex(
+                in: records,
+                matchingNormalizedMAC: router.deviceID
+            ) {
                 let existing = records[index]
                 records[index] = AppDeviceConnectionRecord(
                     id: existing.id,
@@ -480,12 +782,13 @@ final class RouterConnectionModel {
         }
 
         for host in savedHosts where !records.contains(where: { $0.routerHost?.id == host.id }) {
-            if let index = records.firstIndex(where: { record in
-                guard let hostMAC = DeviceIdentityDeduplicator.normalizedMAC(host.deviceID),
-                      let deviceMAC = DeviceIdentityDeduplicator.normalizedMAC(record.identity?.macAddress)
-                else { return false }
-                return hostMAC == deviceMAC
-            }) {
+            let hostMAC = DeviceIdentityDeduplicator.normalizedMAC(host.deviceID)
+            let index = hostMAC.flatMap { normalizedMAC in
+                uniqueSavedHost(matchingNormalizedMAC: normalizedMAC)?.id == host.id
+                    ? Self.uniqueRecordIndex(in: records, matchingNormalizedMAC: normalizedMAC)
+                    : nil
+            }
+            if let index {
                 let existing = records[index]
                 records[index] = AppDeviceConnectionRecord(
                     id: existing.id,
@@ -520,6 +823,34 @@ final class RouterConnectionModel {
         }
     }
     #endif
+
+    private func uniqueSavedHost(matchingNormalizedMAC normalizedMAC: String?) -> RouterHostMetadata? {
+        guard let normalizedMAC else { return nil }
+        let matches = savedHosts.filter {
+            DeviceIdentityDeduplicator.normalizedMAC($0.deviceID) == normalizedMAC
+        }
+        guard matches.count == 1 else { return nil }
+        return matches[0]
+    }
+
+    private static func uniqueRecordIndex(
+        in records: [AppDeviceConnectionRecord],
+        matchingNormalizedMAC normalizedMAC: String?
+    ) -> Int? {
+        guard let normalizedMAC else { return nil }
+        return uniqueRecordIndex(in: records) {
+            DeviceIdentityDeduplicator.normalizedMAC($0.identity?.macAddress) == normalizedMAC
+        }
+    }
+
+    private static func uniqueRecordIndex(
+        in records: [AppDeviceConnectionRecord],
+        where matches: (AppDeviceConnectionRecord) -> Bool
+    ) -> Int? {
+        let matchingIndices = records.indices.filter { matches(records[$0]) }
+        guard matchingIndices.count == 1 else { return nil }
+        return matchingIndices[0]
+    }
 
     private func availability(for host: RouterHostMetadata) -> RouterClientCredentialAvailability {
         clientCredentialAvailability[host.endpoint.peripheralID] ?? .unknown
@@ -641,13 +972,6 @@ final class RouterConnectionModel {
                 model: router.model
             )
         )
-    }
-
-    private static func matches(_ host: RouterHostMetadata, router: DiscoveredRouter) -> Bool {
-        if let hostMAC = DeviceIdentityDeduplicator.normalizedMAC(host.deviceID) {
-            return hostMAC == router.deviceID
-        }
-        return host.endpoint.peripheralID == router.endpoint.peripheralID
     }
 
     private static func displayName(for record: AppDeviceConnectionRecord) -> String {

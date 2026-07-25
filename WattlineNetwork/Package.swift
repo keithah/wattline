@@ -8,12 +8,17 @@ let package = Package(
         .library(name: "WattlineNetwork", targets: ["WattlineNetwork"])
     ],
     dependencies: [
-        .package(path: "../WattlineCore")
+        .package(path: "../WattlineCore"),
+        .package(url: "https://github.com/keithah/goodcloudkit", revision: "a20abe4c3a59e1a990800c3c5d48fa5f0176314d"),
     ],
     targets: [
         .target(name: "WattlineNetwork", dependencies: [
-            .product(name: "WattlineCore", package: "WattlineCore")
+            .product(name: "WattlineCore", package: "WattlineCore"),
+            .product(name: "GoodCloudKit", package: "goodcloudkit")
         ]),
-        .testTarget(name: "WattlineNetworkTests", dependencies: ["WattlineNetwork"])
+        .testTarget(name: "WattlineNetworkTests", dependencies: [
+            "WattlineNetwork",
+            .product(name: "GoodCloudKit", package: "goodcloudkit")
+        ])
     ]
 )

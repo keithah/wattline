@@ -220,6 +220,7 @@ final class AppModel {
     private let widgetReloadAdapter: WidgetReloadAdapter?
     private let liveActivityCoordinator: LiveActivityCoordinator
     let routerConnections: RouterConnectionModel
+    let goodCloudSettings: GoodCloudSettingsModel
     private(set) var routerAdministration: RouterAdministrationModel
     let routerEnrollmentRoute: RouterEnrollmentRoute
     private var snapshotFlushTask: Task<Void, Never>?
@@ -311,6 +312,7 @@ final class AppModel {
         widgetReloadAdapter: WidgetReloadAdapter? = WidgetReloadAdapter(),
         liveActivityAdapter: any LiveActivityAdapter = SystemLiveActivityAdapter(),
         routerConnections: RouterConnectionModel = .production(),
+        goodCloudSettings: GoodCloudSettingsModel? = nil,
         routerAdministration: RouterAdministrationModel? = nil,
         routerEnrollmentRoute: RouterEnrollmentRoute = RouterEnrollmentRoute()
     ) {
@@ -327,6 +329,9 @@ final class AppModel {
         self.widgetReloadAdapter = widgetReloadAdapter
         self.liveActivityCoordinator = LiveActivityCoordinator(adapter: liveActivityAdapter)
         self.routerConnections = routerConnections
+        self.goodCloudSettings = goodCloudSettings ?? GoodCloudSettingsModel(
+            connections: routerConnections
+        )
         self.routerAdministration = routerAdministration ?? .production(
             connections: routerConnections
         )
@@ -335,7 +340,13 @@ final class AppModel {
         route = onboardingComplete ? .scan : .onboarding
         knownDevices = persistence.loadKnownDevices()
 
-        Task { await routerConnections.reloadSavedHosts() }
+        Task {
+            await self.routerConnections.reloadSavedHosts(refreshGoodCloudRemoteAccess: false)
+            if onboardingComplete {
+                await self.selectReturningSessionGoodCloudHost()
+            }
+            await self.goodCloudSettings.load()
+        }
 
         if persistence.systemSurfacePreferences.lowBatteryEnabled {
             Task { @MainActor [weak self] in
@@ -443,6 +454,7 @@ final class AppModel {
         _ host: RouterHostMetadata,
         endpoints: Set<RouterEndpointCapability> = RouterConnectionModel.canonicalClientEndpoints
     ) {
+        goodCloudSettings.selectHost(host.id)
         do {
             let routerTransport = try routerConnections.makeTransport(for: host)
             routerAdministration = .production(connections: routerConnections)
@@ -799,6 +811,12 @@ final class AppModel {
         }
     }
 
+    func choose(_ record: AppDeviceConnectionRecord) {
+        guard let device = record.bluetoothDevice else { return }
+        goodCloudSettings.selectHost(record.routerHost?.id)
+        choose(device)
+    }
+
     func retryConnection() {
         guard let selectedPeripheralID,
               let context = beginOperationForCurrentTransport()
@@ -1033,6 +1051,16 @@ final class AppModel {
                 }
             }
         }
+    }
+
+    private func selectReturningSessionGoodCloudHost() async {
+        guard let storedID = persistence.lastSuccessfulPeripheralID,
+              let mac = knownDevices[storedID]?.macAddress,
+              let host = await routerConnections.savedHost(matchingDeviceMAC: mac),
+              selectedPeripheralID == storedID,
+              activeTransportKind == .bluetooth
+        else { return }
+        goodCloudSettings.selectHost(host.id)
     }
 
     @discardableResult

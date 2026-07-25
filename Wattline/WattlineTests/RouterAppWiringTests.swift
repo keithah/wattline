@@ -256,6 +256,7 @@ final class RouterAppWiringTests: XCTestCase {
         try await waitUntil { await transport.connectCount == 1 }
 
         XCTAssertEqual(model.activeTransportKind, .router)
+        XCTAssertEqual(model.goodCloudSettings.activeHostID, saved.id)
         XCTAssertFalse(model.supportsManualClockControls)
         XCTAssertEqual(routerFactoryCount, 1)
         XCTAssertEqual(bluetoothFactoryCount, 0, "manual router selection must not instantiate CBCentralManager/BLETransport")
@@ -263,8 +264,570 @@ final class RouterAppWiringTests: XCTestCase {
         XCTAssertEqual(connectCount, 1)
     }
 
+    func testBluetoothPreferredRecordSelectsItsMatchingGoodCloudRouterWithoutCreatingAnotherBluetoothOwner() async throws {
+        var routerFactoryCount = 0
+        let fixture = makeFixture(transportFactory: { _, _ in
+            routerFactoryCount += 1
+            return RouterSelectionTransport(identity: self.identity(mac: nil, cid: nil))
+        })
+        let selectedHost = try host(
+            name: "Kitchen router",
+            address: "192.168.8.1:8377",
+            mac: "DC:04:5A:EB:72:2B"
+        )
+        let otherHost = try host(
+            name: "Cabin router",
+            address: "192.168.9.1:8377",
+            mac: "AA:BB:CC:DD:EE:FF"
+        )
+        try await fixture.hostStore.save(selectedHost)
+        try await fixture.hostStore.save(otherHost)
+        await fixture.model.reloadSavedHosts()
+
+        let bluetoothTransport = RouterSelectionTransport(
+            identity: identity(mac: selectedHost.deviceID, cid: 0x0302)
+        )
+        var bluetoothFactoryCount = 0
+        let model = AppModel(
+            persistence: testPersistence(),
+            transportFactory: {
+                bluetoothFactoryCount += 1
+                return bluetoothTransport
+            },
+            snapshotCoordinator: nil,
+            widgetReloadAdapter: nil,
+            liveActivityAdapter: RouterNoopLiveActivityAdapter(),
+            routerConnections: fixture.model
+        )
+        model.requestBluetoothAfterPriming()
+
+        let bluetoothDevice = DiscoveredDevice(
+            id: UUID(),
+            localName: "Link-Power",
+            rssi: -40,
+            mode: .application
+        )
+        let cachedIdentity = AppModel.CachedIdentity(
+            advertisedName: bluetoothDevice.localName,
+            deviceInformationName: "Link-Power 2",
+            macAddress: selectedHost.deviceID
+        )
+        let record = try XCTUnwrap(fixture.model.scanRecords(
+            bluetooth: [bluetoothDevice],
+            identities: [bluetoothDevice.id: cachedIdentity]
+        ).first { $0.bluetoothDevice?.id == bluetoothDevice.id })
+        XCTAssertEqual(record.preferredTransport, .bluetooth)
+        XCTAssertEqual(record.routerHost?.id, selectedHost.id)
+
+        model.choose(record)
+        try await waitUntil { await bluetoothTransport.connectCount == 1 }
+
+        XCTAssertEqual(model.goodCloudSettings.activeHostID, selectedHost.id)
+        XCTAssertEqual(model.activeTransportKind, .bluetooth)
+        XCTAssertEqual(routerFactoryCount, 0)
+        XCTAssertEqual(bluetoothFactoryCount, 1, "record selection must keep the existing single BLE owner")
+
+        let unmatchedDevice = DiscoveredDevice(
+            id: UUID(),
+            localName: "Unmatched Link-Power",
+            rssi: -45,
+            mode: .application
+        )
+        let unmatchedRecord = try XCTUnwrap(fixture.model.scanRecords(
+            bluetooth: [unmatchedDevice],
+            identities: [
+                unmatchedDevice.id: AppModel.CachedIdentity(
+                    advertisedName: unmatchedDevice.localName,
+                    deviceInformationName: "Link-Power 2",
+                    macAddress: "77:88:99:AA:BB:CC"
+                ),
+            ]
+        ).first { $0.bluetoothDevice?.id == unmatchedDevice.id })
+        XCTAssertNil(unmatchedRecord.routerHost)
+
+        model.choose(unmatchedRecord)
+        try await waitUntil { await bluetoothTransport.connectCount == 2 }
+
+        XCTAssertNil(model.goodCloudSettings.activeHostID)
+        XCTAssertEqual(bluetoothFactoryCount, 1, "switching BLE devices must retain exactly one BLE owner")
+    }
+
+    func testBluetoothRecordWithDuplicateMACHostsKeepsGoodCloudSelectionAmbiguous() async throws {
+        let discoverySource = RouterWiringDiscoverySource()
+        var routerFactoryCount = 0
+        let fixture = makeFixture(
+            discovery: RouterDiscovery(source: discoverySource),
+            transportFactory: { _, _ in
+                routerFactoryCount += 1
+                return RouterSelectionTransport(identity: self.identity(mac: nil, cid: nil))
+            }
+        )
+        let firstHost = try host(
+            name: "Kitchen LAN",
+            address: "192.168.8.1:8377",
+            mac: "DC:04:5A:EB:72:2B"
+        )
+        let secondHost = try host(
+            name: "Kitchen VPN",
+            address: "kitchen.tailnet.ts.net:8377",
+            reachability: .vpn,
+            mac: "dc-04-5a-eb-72-2b"
+        )
+        try await fixture.hostStore.save(firstHost)
+        try await fixture.hostStore.save(secondHost)
+        await fixture.model.reloadSavedHosts()
+
+        let associationStore = GoodCloudAssociationStore(
+            backend: RouterWiringAssociationBackend()
+        )
+        for (host, deviceID) in [(firstHost, "first"), (secondHost, "second")] {
+            try await associationStore.save(GoodCloudAssociation(
+                hostID: host.id,
+                routerMAC: try XCTUnwrap(host.deviceID),
+                device: GoodCloudDeviceSummary(
+                    id: deviceID,
+                    name: host.displayName,
+                    mac: try XCTUnwrap(host.deviceID),
+                    ddns: nil,
+                    model: "GL-X3000",
+                    isOnline: true
+                )
+            ))
+        }
+        let settings = GoodCloudSettingsModel(
+            account: nil,
+            associations: associationStore,
+            connections: fixture.model
+        )
+
+        let bluetoothTransport = RouterSelectionTransport(
+            identity: identity(mac: "DC045AEB722B", cid: 0x0302)
+        )
+        var bluetoothFactoryCount = 0
+        let model = AppModel(
+            persistence: testPersistence(),
+            transportFactory: {
+                bluetoothFactoryCount += 1
+                return bluetoothTransport
+            },
+            snapshotCoordinator: nil,
+            widgetReloadAdapter: nil,
+            liveActivityAdapter: RouterNoopLiveActivityAdapter(),
+            routerConnections: fixture.model,
+            goodCloudSettings: settings
+        )
+        model.requestBluetoothAfterPriming()
+
+        fixture.model.startDiscovery()
+        try await waitUntil { discoverySource.startCount == 1 }
+        discoverySource.yield([
+            RouterServiceRecord(
+                serviceName: "Kitchen router",
+                domain: "local.",
+                host: "kitchen.local.",
+                port: 8377,
+                txt: [
+                    "api": Data("1".utf8),
+                    "auth": Data("pin".utf8),
+                    "id": Data("DC:04:5A:EB:72:2B".utf8),
+                    "model": Data("BP4SL3V2".utf8),
+                    "cid": Data("0302".utf8),
+                    "features": Data("00000fff".utf8),
+                    "tls": Data("none".utf8),
+                ]
+            ),
+        ])
+        try await waitUntil { await fixture.model.discoveredRouters.count == 1 }
+
+        let bluetoothDevice = DiscoveredDevice(
+            id: UUID(),
+            localName: "Link-Power",
+            rssi: -40,
+            mode: .application
+        )
+        let record = try XCTUnwrap(fixture.model.scanRecords(
+            bluetooth: [bluetoothDevice],
+            identities: [
+                bluetoothDevice.id: AppModel.CachedIdentity(
+                    advertisedName: bluetoothDevice.localName,
+                    deviceInformationName: "Link-Power 2",
+                    macAddress: "DC045AEB722B"
+                ),
+            ]
+        ).first { $0.bluetoothDevice?.id == bluetoothDevice.id })
+
+        XCTAssertNotNil(record.discoveredRouter)
+        XCTAssertNil(record.routerHost)
+        XCTAssertEqual(record.transportOptions, [.bluetooth, .router])
+
+        model.choose(record)
+        try await waitUntil { await bluetoothTransport.connectCount == 1 }
+        await settings.load()
+
+        XCTAssertNil(settings.activeHostID)
+        XCTAssertNil(settings.association)
+        XCTAssertEqual(routerFactoryCount, 0)
+        XCTAssertEqual(bluetoothFactoryCount, 1, "ambiguous routing must retain exactly one BLE owner")
+    }
+
+    func testReturningBluetoothSessionSelectsMatchingGoodCloudRouterWithTwoSavedHosts() async throws {
+        var routerFactoryCount = 0
+        let fixture = makeFixture(transportFactory: { _, _ in
+            routerFactoryCount += 1
+            return RouterSelectionTransport(identity: self.identity(mac: nil, cid: nil))
+        })
+        let selectedHost = try host(
+            name: "Kitchen router",
+            address: "192.168.8.1:8377",
+            mac: "DC:04:5A:EB:72:2B"
+        )
+        let otherHost = try host(
+            name: "Cabin router",
+            address: "192.168.9.1:8377",
+            mac: "AA:BB:CC:DD:EE:FF"
+        )
+        try await fixture.hostStore.save(selectedHost)
+        try await fixture.hostStore.save(otherHost)
+
+        let peripheralID = UUID()
+        let persistence = testPersistence()
+        persistence.onboardingComplete = true
+        persistence.lastSuccessfulPeripheralID = peripheralID
+        persistence.saveKnownDevices([
+            peripheralID: AppModel.CachedIdentity(
+                advertisedName: "Link-Power",
+                deviceInformationName: "Link-Power 2",
+                macAddress: selectedHost.deviceID
+            ),
+        ])
+        let bluetoothTransport = RouterSelectionTransport(
+            identity: identity(id: peripheralID, mac: selectedHost.deviceID, cid: 0x0302)
+        )
+        var bluetoothFactoryCount = 0
+
+        let model = AppModel(
+            persistence: persistence,
+            transportFactory: {
+                bluetoothFactoryCount += 1
+                return bluetoothTransport
+            },
+            snapshotCoordinator: nil,
+            widgetReloadAdapter: nil,
+            liveActivityAdapter: RouterNoopLiveActivityAdapter(),
+            routerConnections: fixture.model
+        )
+        try await waitUntil { await model.goodCloudSettings.activeHostID != nil }
+
+        XCTAssertEqual(model.goodCloudSettings.activeHostID, selectedHost.id)
+        XCTAssertEqual(model.activeTransportKind, .bluetooth)
+        XCTAssertEqual(routerFactoryCount, 0)
+        XCTAssertEqual(bluetoothFactoryCount, 1, "returning session must retain exactly one BLE owner")
+    }
+
+    func testReturningHostLookupRejectsDuplicateMACAmbiguity() async throws {
+        let fixture = makeFixture()
+        let first = try host(
+            name: "Kitchen LAN",
+            address: "192.168.8.1:8377",
+            mac: "DC:04:5A:EB:72:2B"
+        )
+        let second = try host(
+            name: "Kitchen VPN",
+            address: "kitchen.tailnet.ts.net:8377",
+            reachability: .vpn,
+            mac: "dc-04-5a-eb-72-2b"
+        )
+        try await fixture.hostStore.save(first)
+        try await fixture.hostStore.save(second)
+
+        let match = await fixture.model.savedHost(matchingDeviceMAC: "DC045AEB722B")
+
+        XCTAssertNil(match)
+    }
+
+    func testProductionUsesOneGoodCloudServiceForAssociatedRouterWithoutCreatingBLEOwner() async throws {
+        let suite = "RouterAppWiringTests.GoodCloud.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let device = GoodCloudDeviceSummary(
+            id: "42",
+            name: "Wattline X3000",
+            mac: "DC:04:5A:EB:72:2B",
+            ddns: "wattline.glddns.com",
+            model: "GL-X3000",
+            isOnline: true
+        )
+        let account = GoodCloudAccountService.accountOnly(
+            client: RouterWiringGoodCloudClient(devices: [device])
+        )
+        let associationStore = GoodCloudAssociationStore(
+            backend: RouterWiringAssociationBackend()
+        )
+        var accountFactoryCount = 0
+        var associationFactoryCount = 0
+        var directFactoryCount = 0
+        var preferredFactoryDeviceIDs: [String] = []
+        let preferredTransport = RouterSelectionTransport(
+            identity: identity(mac: "DC:04:5A:EB:72:2B", cid: 0x0302)
+        )
+        let connections = RouterConnectionModel.production(
+            defaults: defaults,
+            goodCloudAccountFactory: {
+                accountFactoryCount += 1
+                return RouterConnectionModel.GoodCloudAccountDependencies(
+                    account: account,
+                    provisioner: account
+                )
+            },
+            goodCloudAssociationStoreFactory: {
+                associationFactoryCount += 1
+                return associationStore
+            },
+            directTransportFactory: { _, _ in
+                directFactoryCount += 1
+                return RouterSelectionTransport(identity: self.identity(mac: nil, cid: nil))
+            },
+            preferredTransportFactory: { _, _, association, _ in
+                preferredFactoryDeviceIDs.append(association.goodCloudDeviceID)
+                return preferredTransport
+            }
+        )
+        let saved = try host(
+            name: "Router",
+            address: "192.168.8.1:8377",
+            mac: "DC:04:5A:EB:72:2B"
+        )
+        try await connections.hostStore.save(saved)
+        try await associationStore.save(
+            GoodCloudAssociation(
+                hostID: saved.id,
+                routerMAC: "DC045AEB722B",
+                device: device
+            )
+        )
+        await connections.reloadSavedHosts()
+
+        var bluetoothFactoryCount = 0
+        let model = AppModel(
+            persistence: testPersistence(),
+            transportFactory: {
+                bluetoothFactoryCount += 1
+                return RouterSelectionTransport(identity: self.identity(mac: nil, cid: nil))
+            },
+            snapshotCoordinator: nil,
+            widgetReloadAdapter: nil,
+            liveActivityAdapter: RouterNoopLiveActivityAdapter(),
+            routerConnections: connections
+        )
+        model.connectViaRouter(saved)
+        try await waitUntil { await preferredTransport.connectCount == 1 }
+
+        XCTAssertEqual(accountFactoryCount, 1)
+        XCTAssertEqual(associationFactoryCount, 1)
+        XCTAssertEqual(preferredFactoryDeviceIDs, ["42"])
+        XCTAssertEqual(directFactoryCount, 0)
+        XCTAssertEqual(bluetoothFactoryCount, 0)
+    }
+
+    func testAdministrationUsesRouterConnectionHTTPRouteFactory() async throws {
+        let recorder = RouterAdministrationHTTPFactoryRecorder()
+        let connections = RouterConnectionModel(
+            hostStore: RouterHostStore(backend: RouterHostMemoryBackend()),
+            credentialStore: RouterCredentialStore(backend: RouterCredentialMemoryBackend()),
+            enrollmentClientFactory: { _ in
+                throw NetworkError.unsupported("not used")
+            },
+            transportFactory: { _, _ in
+                RouterSelectionTransport(identity: self.identity(mac: nil, cid: nil))
+            },
+            administrationHTTPFactory: { endpoint in
+                recorder.makeClient(endpoint: endpoint)
+            }
+        )
+        let administration = RouterAdministrationModel.production(connections: connections)
+        let saved = try host(
+            name: "Router",
+            address: "192.168.8.1:8377",
+            mac: "DC:04:5A:EB:72:2B"
+        )
+
+        await administration.begin(host: saved)
+
+        XCTAssertEqual(recorder.endpoints, [saved.endpoint, saved.endpoint])
+    }
+
+    func testRealAccountExpiryRevokesRemoteRouteBeforeRequestReturnsWithoutSettingsListener() async throws {
+        let saved = try host(
+            name: "Router",
+            address: "192.168.8.1:8377",
+            mac: "DC:04:5A:EB:72:2B"
+        )
+        let device = GoodCloudDeviceSummary(
+            id: "42",
+            name: "Wattline X3000",
+            mac: "DC:04:5A:EB:72:2B",
+            ddns: nil,
+            model: "GL-X3000",
+            isOnline: true
+        )
+        let account = GoodCloudAccountService.accountOnly(
+            client: RouterWiringGoodCloudClient(devices: [device]),
+            injectedRemoteAccessFailure: .sessionExpired
+        )
+        let hostStore = RouterHostStore(backend: RouterHostMemoryBackend())
+        try await hostStore.save(saved)
+        var directTransportCount = 0
+        var preferredTransportCount = 0
+        let model = RouterConnectionModel(
+            hostStore: hostStore,
+            credentialStore: RouterCredentialStore(backend: RouterCredentialMemoryBackend()),
+            enrollmentClientFactory: { _ in throw NetworkError.unsupported("not used") },
+            transportFactory: { _, _ in
+                directTransportCount += 1
+                return RouterSelectionTransport(identity: self.identity(mac: nil, cid: nil))
+            },
+            goodCloudAccount: .init(account: account, provisioner: account),
+            goodCloudAssociationLoader: {
+                [GoodCloudAssociation(
+                    hostID: saved.id,
+                    routerMAC: "DC045AEB722B",
+                    device: device
+                )]
+            },
+            preferredTransportFactory: { _, _, _, _ in
+                preferredTransportCount += 1
+                return RouterSelectionTransport(identity: self.identity(mac: nil, cid: nil))
+            }
+        )
+        await model.reloadSavedHosts()
+        _ = try model.makeTransport(for: saved)
+        XCTAssertEqual(preferredTransportCount, 1)
+
+        let coordinator = GoodCloudRelayCoordinator.production(
+            deviceID: device.id,
+            provisioner: account
+        )
+        do {
+            _ = try await coordinator.request(
+                method: "GET",
+                path: "/api/v1/status",
+                headers: [:],
+                body: nil
+            )
+            XCTFail("Expected the expired GoodCloud session to reject the request")
+        } catch {
+            XCTAssertEqual(error as? NetworkError, .goodCloudSessionExpired)
+        }
+
+        _ = try model.makeTransport(for: saved)
+        XCTAssertEqual(directTransportCount, 1)
+        XCTAssertEqual(preferredTransportCount, 1)
+    }
+
+    func testOlderAuthenticatedRefreshCannotRepublishRemoteAccessAfterLogoutRefresh() async throws {
+        let saved = try host(
+            name: "Router",
+            address: "192.168.8.1:8377",
+            mac: "DC:04:5A:EB:72:2B"
+        )
+        let device = GoodCloudDeviceSummary(
+            id: "42",
+            name: "Wattline X3000",
+            mac: "DC:04:5A:EB:72:2B",
+            ddns: "wattline.glddns.com",
+            model: "GL-X3000",
+            isOnline: true
+        )
+        let account = SequencedGoodCloudAccount(states: [
+            .authenticated([device]),
+            .authenticated([device]),
+            .loggedOut,
+        ])
+        let provisioner = GoodCloudAccountService.accountOnly(
+            client: RouterWiringGoodCloudClient(devices: [])
+        )
+        let associationLoader = ControllableGoodCloudAssociationLoader(
+            associations: [
+                GoodCloudAssociation(
+                    hostID: saved.id,
+                    routerMAC: "DC045AEB722B",
+                    device: device
+                ),
+            ]
+        )
+
+        let hostStore = RouterHostStore(backend: RouterHostMemoryBackend())
+        try await hostStore.save(saved)
+        let administrationRecorder = RouteFactoryRecorder()
+        let administrationRegistry = GoodCloudAdministrationHTTPRegistry(
+            directFactory: { endpoint in
+                administrationRecorder.makeDirectClient(endpoint: endpoint)
+            },
+            preferredFactory: { endpoint, _, _ in
+                administrationRecorder.makePreferredClient(endpoint: endpoint)
+            }
+        )
+        var directTransportCount = 0
+        var preferredTransportCount = 0
+        let model = RouterConnectionModel(
+            hostStore: hostStore,
+            credentialStore: RouterCredentialStore(backend: RouterCredentialMemoryBackend()),
+            enrollmentClientFactory: { _ in
+                throw NetworkError.unsupported("not used")
+            },
+            transportFactory: { _, _ in
+                directTransportCount += 1
+                return RouterSelectionTransport(identity: self.identity(mac: nil, cid: nil))
+            },
+            goodCloudAccount: .init(account: account, provisioner: provisioner),
+            goodCloudAssociationLoader: { await associationLoader.load() },
+            preferredTransportFactory: { _, _, _, _ in
+                preferredTransportCount += 1
+                return RouterSelectionTransport(identity: self.identity(mac: nil, cid: nil))
+            },
+            administrationHTTPFactory: { endpoint in
+                try administrationRegistry.client(for: endpoint)
+            },
+            goodCloudAdministrationHTTPRegistry: administrationRegistry
+        )
+
+        await model.reloadSavedHosts()
+        _ = try model.makeTransport(for: saved)
+        _ = try model.administrationHTTPFactory(saved.endpoint)
+        await associationLoader.holdNext()
+
+        let olderRefresh = Task {
+            await model.reloadSavedHosts()
+        }
+        do {
+            try await waitUntil(timeout: .seconds(2)) {
+                await associationLoader.isBlocked
+            }
+        } catch {
+            olderRefresh.cancel()
+            await associationLoader.disarm()
+            await olderRefresh.value
+            throw error
+        }
+        await model.refreshGoodCloudRemoteAccess()
+        await associationLoader.release()
+        olderRefresh.cancel()
+        await olderRefresh.value
+
+        _ = try model.makeTransport(for: saved)
+        _ = try model.administrationHTTPFactory(saved.endpoint)
+
+        XCTAssertEqual(directTransportCount, 1)
+        XCTAssertEqual(preferredTransportCount, 1)
+        XCTAssertEqual(administrationRecorder.directCount, 1)
+        XCTAssertEqual(administrationRecorder.preferredCount, 1)
+    }
+
     private func makeFixture(
         hostBackend: RouterHostMemoryBackend = RouterHostMemoryBackend(),
+        discovery: RouterDiscovery? = nil,
         enrollmentClientFactory: @escaping RouterConnectionModel.EnrollmentClientFactory = { _ in
             throw NetworkError.unsupported("Enrollment client not configured")
         },
@@ -279,6 +842,7 @@ final class RouterAppWiringTests: XCTestCase {
             model: RouterConnectionModel(
                 hostStore: hostStore,
                 credentialStore: credentialStore,
+                discovery: discovery,
                 enrollmentClientFactory: enrollmentClientFactory,
                 transportFactory: transportFactory
             ),
@@ -371,6 +935,161 @@ private final class RouterHostMemoryBackend: RouterHostKeyValueStore, @unchecked
 
 private enum RouterHostBackendError: Error, Equatable {
     case writeFailed
+}
+
+private actor RouterWiringGoodCloudClient: GoodCloudAccountClient {
+    private let storedDevices: [GoodCloudDeviceSummary]
+
+    init(devices: [GoodCloudDeviceSummary]) {
+        storedDevices = devices
+    }
+
+    func hasStoredToken() async -> Bool { true }
+    func login(email: String, password: String) async throws {}
+    func devices() async throws -> [GoodCloudDeviceSummary] { storedDevices }
+    func logout() async throws {}
+}
+
+private final class RouterWiringAssociationBackend: GoodCloudAssociationKeyValueStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String: Data] = [:]
+
+    func data(forKey key: String) -> Data? {
+        lock.withLock { values[key] }
+    }
+
+    func set(_ data: Data?, forKey key: String) {
+        lock.withLock { values[key] = data }
+    }
+}
+
+private final class RouterWiringDiscoverySource: RouterDiscoverySource, @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: AsyncStream<[RouterServiceRecord]>.Continuation?
+    private var starts = 0
+
+    var startCount: Int { lock.withLock { starts } }
+
+    func snapshots(serviceType: String) -> AsyncStream<[RouterServiceRecord]> {
+        AsyncStream { continuation in
+            lock.withLock {
+                starts += 1
+                self.continuation = continuation
+            }
+        }
+    }
+
+    func yield(_ records: [RouterServiceRecord]) {
+        lock.withLock { continuation }?.yield(records)
+    }
+}
+
+private actor SequencedGoodCloudAccount: GoodCloudAccountServing {
+    private var states: [GoodCloudSessionState]
+
+    init(states: [GoodCloudSessionState]) {
+        self.states = states
+    }
+
+    func validateStoredSession() async -> GoodCloudSessionState {
+        states.removeFirst()
+    }
+
+    func login(email: String, password: String) async -> GoodCloudSessionState { .loggedOut }
+    func refreshDevices() async -> GoodCloudSessionState { .loggedOut }
+    func logout() async -> GoodCloudSessionState { .loggedOut }
+}
+
+private actor ControllableGoodCloudAssociationLoader {
+    private let associations: [GoodCloudAssociation]
+    private var shouldHoldNext = false
+    private var holdContinuation: CheckedContinuation<Void, Never>?
+    private(set) var isBlocked = false
+
+    init(associations: [GoodCloudAssociation]) {
+        self.associations = associations
+    }
+
+    func holdNext() {
+        shouldHoldNext = true
+    }
+
+    func load() async -> [GoodCloudAssociation] {
+        guard shouldHoldNext else { return associations }
+        shouldHoldNext = false
+        guard !Task.isCancelled else { return associations }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume()
+                } else {
+                    isBlocked = true
+                    holdContinuation = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.release() }
+        }
+        return associations
+    }
+
+    func release() {
+        isBlocked = false
+        let continuation = holdContinuation
+        holdContinuation = nil
+        continuation?.resume()
+    }
+
+    func disarm() {
+        shouldHoldNext = false
+        release()
+    }
+}
+
+private final class RouteFactoryRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedDirectCount = 0
+    private var recordedPreferredCount = 0
+
+    var directCount: Int { lock.withLock { recordedDirectCount } }
+    var preferredCount: Int { lock.withLock { recordedPreferredCount } }
+
+    func makeDirectClient(endpoint: RouterEndpoint) -> any RouterHTTPClient {
+        lock.withLock { recordedDirectCount += 1 }
+        return RouterAdministrationNoopHTTPClient()
+    }
+
+    func makePreferredClient(endpoint: RouterEndpoint) -> any RouterHTTPClient {
+        lock.withLock { recordedPreferredCount += 1 }
+        return RouterAdministrationNoopHTTPClient()
+    }
+}
+
+private final class RouterAdministrationHTTPFactoryRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedEndpoints: [RouterEndpoint] = []
+
+    var endpoints: [RouterEndpoint] { lock.withLock { recordedEndpoints } }
+
+    func makeClient(endpoint: RouterEndpoint) -> any RouterHTTPClient {
+        lock.withLock { recordedEndpoints.append(endpoint) }
+        return RouterAdministrationNoopHTTPClient()
+    }
+}
+
+private actor RouterAdministrationNoopHTTPClient: RouterHTTPClient {
+    func get(_ path: String, token: String) async throws -> (Data, HTTPURLResponse) {
+        try await request("GET", path, body: nil, token: token)
+    }
+
+    func request(
+        _ method: String,
+        _ path: String,
+        body: Data?,
+        token: String
+    ) async throws -> (Data, HTTPURLResponse) {
+        throw NetworkError.unsupported("request not expected")
+    }
 }
 
 private actor RouterEnrollmentHTTPRecorder: RouterEnrollmentHTTPClient {

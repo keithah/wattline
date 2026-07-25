@@ -1,0 +1,621 @@
+import Foundation
+@testable import WattlineNetwork
+import XCTest
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+
+final class PreferredRouterRouteTests: XCTestCase {
+    func testLANSuccessNeverCallsRemoteAndSelectsLocal() async throws {
+        let lan = ScriptedPreferredHTTPClient(results: [.success(Self.okResponse(body: #"{"ok":true}"#))])
+        let remote = ScriptedPreferredHTTPClient(results: [])
+        let route = PreferredRouterRoute(
+            lanHTTP: lan,
+            lanEvents: ScriptedPreferredEventStream(scripts: []),
+            remoteHTTP: remote,
+            remoteEvents: ScriptedPreferredEventStream(scripts: [])
+        )
+
+        _ = try await PreferredRouterHTTPClient(route: route).get(
+            "/api/v1/status",
+            token: "wattline-token"
+        )
+
+        let lanCallCount = await lan.callCount
+        let remoteCallCount = await remote.callCount
+        let selected = await route.selected
+        XCTAssertEqual(lanCallCount, 1)
+        XCTAssertEqual(remoteCallCount, 0)
+        XCTAssertEqual(selected, .local)
+    }
+
+    func testOnlyExplicitReachabilityFailuresPermitRemoteFallback() async throws {
+        let permitted: [Error] = [
+            URLError(.notConnectedToInternet),
+            URLError(.cannotFindHost),
+            URLError(.cannotConnectToHost),
+            URLError(.networkConnectionLost),
+            URLError(.timedOut),
+            URLError(.dnsLookupFailed),
+            NetworkError.transport("typed transport failure"),
+        ]
+        for error in permitted {
+            let remote = ScriptedPreferredHTTPClient(results: [.success(Self.okResponse())])
+            let route = Self.makeRoute(lanError: error, remoteHTTP: remote)
+
+            _ = try await PreferredRouterHTTPClient(route: route).get(
+                "/api/v1/status",
+                token: "wattline-token"
+            )
+
+            let remoteCallCount = await remote.callCount
+            let selected = await route.selected
+            XCTAssertEqual(remoteCallCount, 1, "expected fallback for \(error)")
+            XCTAssertEqual(selected, .remote)
+        }
+    }
+
+    func testTLSAuthAPIDecodeAndCancellationFailuresNeverCallRemote() async {
+        let authoritative: [Error] = [
+            URLError(.serverCertificateUntrusted),
+            URLError(.secureConnectionFailed),
+            URLError(.cancelled),
+            NetworkError.unauthorized,
+            NetworkError.api(status: 409, code: .operationInProgress, message: "busy"),
+            NetworkError.httpStatus(500, "server"),
+            NetworkError.decode("bad json"),
+            NetworkError.goodCloudSessionExpired,
+            CancellationError(),
+        ]
+        for error in authoritative {
+            let remote = ScriptedPreferredHTTPClient(results: [.success(Self.okResponse())])
+            let route = Self.makeRoute(lanError: error, remoteHTTP: remote)
+
+            do {
+                _ = try await PreferredRouterHTTPClient(route: route).get(
+                    "/api/v1/status",
+                    token: "wattline-token"
+                )
+                XCTFail("expected authoritative LAN failure for \(error)")
+            } catch {
+                // The exact LAN failure remains authoritative.
+            }
+
+            let remoteCallCount = await remote.callCount
+            let selected = await route.selected
+            XCTAssertEqual(remoteCallCount, 0, "must not fall back for \(error)")
+            XCTAssertEqual(selected, .local)
+        }
+    }
+
+    func testRemoteSelectionIsSharedBySubsequentHTTPRequestsInBatch() async throws {
+        let lan = ScriptedPreferredHTTPClient(results: [
+            .failure(URLError(.cannotConnectToHost)),
+            .success(Self.okResponse()),
+        ])
+        let remote = ScriptedPreferredHTTPClient(results: [
+            .success(Self.okResponse()),
+            .success(Self.okResponse()),
+        ])
+        let route = PreferredRouterRoute(
+            lanHTTP: lan,
+            lanEvents: ScriptedPreferredEventStream(scripts: []),
+            remoteHTTP: remote,
+            remoteEvents: ScriptedPreferredEventStream(scripts: [])
+        )
+        let client = PreferredRouterHTTPClient(route: route)
+
+        _ = try await client.get("/api/v1/status", token: "wattline-token")
+        _ = try await client.request(
+            "PUT",
+            "/api/v1/settings",
+            body: Data(#"{"enabled":true}"#.utf8),
+            token: "wattline-token"
+        )
+
+        let lanCallCount = await lan.callCount
+        let remoteCallCount = await remote.callCount
+        let selected = await route.selected
+        XCTAssertEqual(lanCallCount, 1)
+        XCTAssertEqual(remoteCallCount, 2)
+        XCTAssertEqual(selected, .remote)
+    }
+
+    func testRemoteSessionExpiryRetriesLANAndSelectsLocal() async throws {
+        let lan = ScriptedPreferredHTTPClient(results: [
+            .failure(URLError(.cannotConnectToHost)),
+            .success(Self.okResponse()),
+        ])
+        let remote = ScriptedPreferredHTTPClient(results: [
+            .success(Self.okResponse()),
+            .failure(NetworkError.goodCloudSessionExpired),
+        ])
+        let route = PreferredRouterRoute(
+            lanHTTP: lan,
+            lanEvents: ScriptedPreferredEventStream(scripts: []),
+            remoteHTTP: remote,
+            remoteEvents: ScriptedPreferredEventStream(scripts: [])
+        )
+        let client = PreferredRouterHTTPClient(route: route)
+
+        _ = try await client.get("/api/v1/status", token: "wattline-token")
+        _ = try await client.get("/api/v1/status", token: "wattline-token")
+
+        let lanCallCount = await lan.callCount
+        let remoteCallCount = await remote.callCount
+        let selected = await route.selected
+        XCTAssertEqual(lanCallCount, 2)
+        XCTAssertEqual(remoteCallCount, 2)
+        XCTAssertEqual(selected, .local)
+    }
+
+    func testRemoteSessionExpiryDoesNotRetryDeadRemoteWhenLANIsUnreachable() async {
+        let lan = ScriptedPreferredHTTPClient(results: [
+            .failure(URLError(.cannotConnectToHost)),
+            .failure(URLError(.cannotConnectToHost)),
+        ])
+        let remote = ScriptedPreferredHTTPClient(results: [
+            .success(Self.okResponse()),
+            .failure(NetworkError.goodCloudSessionExpired),
+        ])
+        let route = PreferredRouterRoute(
+            lanHTTP: lan,
+            lanEvents: ScriptedPreferredEventStream(scripts: []),
+            remoteHTTP: remote,
+            remoteEvents: ScriptedPreferredEventStream(scripts: [])
+        )
+        let client = PreferredRouterHTTPClient(route: route)
+
+        do {
+            _ = try await client.get("/api/v1/status", token: "wattline-token")
+            _ = try await client.get("/api/v1/status", token: "wattline-token")
+            XCTFail("expected LAN reachability failure")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .cannotConnectToHost)
+        }
+
+        let lanCallCount = await lan.callCount
+        let remoteCallCount = await remote.callCount
+        let selected = await route.selected
+        XCTAssertEqual(lanCallCount, 2)
+        XCTAssertEqual(remoteCallCount, 2)
+        XCTAssertEqual(selected, .local)
+    }
+
+    func testOlderLANSuccessCannotUndoNewerRemoteSelection() async throws {
+        let lan = SuspendedPreferredHTTPClient()
+        let remote = ScriptedPreferredHTTPClient(results: [
+            .success(Self.okResponse()),
+            .success(Self.okResponse()),
+        ])
+        let route = PreferredRouterRoute(
+            lanHTTP: lan,
+            lanEvents: ScriptedPreferredEventStream(scripts: []),
+            remoteHTTP: remote,
+            remoteEvents: ScriptedPreferredEventStream(scripts: [])
+        )
+        let client = PreferredRouterHTTPClient(route: route)
+        let olderCompletion = PreferredRouteTaskCompletionProbe()
+
+        let olderRequest = Task {
+            do {
+                let response = try await client.get(
+                    "/api/v1/status",
+                    token: "wattline-token"
+                )
+                await olderCompletion.mark()
+                return response
+            } catch {
+                await olderCompletion.mark()
+                throw error
+            }
+        }
+        do {
+            try await lan.waitUntilFirstRequestIsSuspended()
+            _ = try await client.get("/api/v1/status", token: "wattline-token")
+            let selectedAfterFallback = await route.selected
+            XCTAssertEqual(selectedAfterFallback, .remote)
+            await lan.resumeFirstRequest(with: .success(Self.okResponse()))
+        } catch {
+            olderRequest.cancel()
+            await lan.resumeFirstRequest(with: .failure(CancellationError()))
+            try await olderCompletion.waitUntilMarked()
+            _ = try? await olderRequest.value
+            throw error
+        }
+        try await olderCompletion.waitUntilMarked()
+        _ = try await olderRequest.value
+        _ = try await client.request(
+            "PUT",
+            "/api/v1/settings",
+            body: Data(#"{"enabled":true}"#.utf8),
+            token: "wattline-token"
+        )
+
+        let lanCallCount = await lan.callCount
+        let remoteCallCount = await remote.callCount
+        let selected = await route.selected
+        XCTAssertEqual(lanCallCount, 2)
+        XCTAssertEqual(remoteCallCount, 2)
+        XCTAssertEqual(selected, .remote)
+    }
+
+    func testOlderLANFailureCannotUndoLaterLocalReselection() async throws {
+        let lan = SuspendedPreferredHTTPClient(subsequentResults: [
+            .failure(URLError(.cannotConnectToHost)),
+            .success(Self.okResponse()),
+        ])
+        let lanEvents = ScriptedPreferredEventStream(scripts: [
+            .values([Data(#"{"route":"local"}"#.utf8)]),
+        ])
+        let remote = ScriptedPreferredHTTPClient(results: [
+            .success(Self.okResponse()),
+            .success(Self.okResponse()),
+        ])
+        let route = PreferredRouterRoute(
+            lanHTTP: lan,
+            lanEvents: lanEvents,
+            remoteHTTP: remote,
+            remoteEvents: ScriptedPreferredEventStream(scripts: [])
+        )
+        let client = PreferredRouterHTTPClient(route: route)
+        let events = PreferredRouterEventStream(route: route)
+        let olderCompletion = PreferredRouteTaskCompletionProbe()
+
+        let olderRequest = Task {
+            do {
+                let response = try await client.get(
+                    "/api/v1/status",
+                    token: "wattline-token"
+                )
+                await olderCompletion.mark()
+                return response
+            } catch {
+                await olderCompletion.mark()
+                throw error
+            }
+        }
+        do {
+            try await lan.waitUntilFirstRequestIsSuspended()
+            _ = try await client.get("/api/v1/status", token: "wattline-token")
+            let selectedAfterFallback = await route.selected
+            XCTAssertEqual(selectedAfterFallback, .remote)
+            _ = try await Self.first(events.events(path: "/api/v1/events", token: "token"))
+            let selectedAfterLocalEvent = await route.selected
+            XCTAssertEqual(selectedAfterLocalEvent, .local)
+            await lan.resumeFirstRequest(with: .failure(URLError(.networkConnectionLost)))
+        } catch {
+            olderRequest.cancel()
+            await lan.resumeFirstRequest(with: .failure(CancellationError()))
+            try await olderCompletion.waitUntilMarked()
+            _ = try? await olderRequest.value
+            throw error
+        }
+        try await olderCompletion.waitUntilMarked()
+        _ = try await olderRequest.value
+        _ = try await client.request(
+            "PUT",
+            "/api/v1/settings",
+            body: Data(#"{"enabled":true}"#.utf8),
+            token: "wattline-token"
+        )
+
+        let lanCallCount = await lan.callCount
+        let remoteCallCount = await remote.callCount
+        let selected = await route.selected
+        XCTAssertEqual(lanCallCount, 3)
+        XCTAssertEqual(remoteCallCount, 2)
+        XCTAssertEqual(selected, .local)
+    }
+
+    func testSuspendedClientConsumesResolutionPublishedBeforeRequestRegistration() async throws {
+        let lan = SuspendedPreferredHTTPClient()
+        let completion = PreferredRouteTaskCompletionProbe()
+        await lan.resumeFirstRequest(with: .success(Self.okResponse()))
+
+        let request = Task {
+            do {
+                let response = try await lan.get("/api/v1/status", token: "token")
+                await completion.mark()
+                return response
+            } catch {
+                await completion.mark()
+                throw error
+            }
+        }
+        do {
+            try await completion.waitUntilMarked(timeout: .seconds(1))
+        } catch {
+            request.cancel()
+            await lan.resumeFirstRequest(with: .failure(CancellationError()))
+            try await completion.waitUntilMarked()
+            _ = try? await request.value
+            throw error
+        }
+
+        _ = try await request.value
+    }
+
+    func testCancelingSuspendedClientRequestCompletesIt() async throws {
+        let lan = SuspendedPreferredHTTPClient()
+        let completion = PreferredRouteTaskCompletionProbe()
+        let request = Task {
+            do {
+                let response = try await lan.get("/api/v1/status", token: "token")
+                await completion.mark()
+                return response
+            } catch {
+                await completion.mark()
+                throw error
+            }
+        }
+        try await lan.waitUntilFirstRequestIsSuspended()
+        request.cancel()
+        do {
+            try await completion.waitUntilMarked(timeout: .seconds(1))
+        } catch {
+            await lan.resumeFirstRequest(with: .failure(CancellationError()))
+            try await completion.waitUntilMarked()
+            _ = try? await request.value
+            throw error
+        }
+
+        do {
+            _ = try await request.value
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("expected cancellation, got \(error)")
+        }
+    }
+
+    func testEachSSEConnectionProbesLANBeforeRemote() async throws {
+        let lanEvents = ScriptedPreferredEventStream(scripts: [
+            .failure(URLError(.cannotConnectToHost)),
+            .values([Data(#"{"route":"local"}"#.utf8)]),
+        ])
+        let remoteEvents = ScriptedPreferredEventStream(scripts: [
+            .values([Data(#"{"route":"remote"}"#.utf8)]),
+        ])
+        let route = PreferredRouterRoute(
+            lanHTTP: ScriptedPreferredHTTPClient(results: []),
+            lanEvents: lanEvents,
+            remoteHTTP: ScriptedPreferredHTTPClient(results: []),
+            remoteEvents: remoteEvents
+        )
+        let events = PreferredRouterEventStream(route: route)
+
+        let first = try await Self.first(events.events(path: "/api/v1/events", token: "token"))
+        let second = try await Self.first(events.events(path: "/api/v1/events", token: "token"))
+
+        XCTAssertEqual(String(decoding: first, as: UTF8.self), #"{"route":"remote"}"#)
+        XCTAssertEqual(String(decoding: second, as: UTF8.self), #"{"route":"local"}"#)
+        XCTAssertEqual(lanEvents.openCount, 2)
+        XCTAssertEqual(remoteEvents.openCount, 1)
+        let selected = await route.selected
+        XCTAssertEqual(selected, .local)
+    }
+
+    func testSSEAuthoritativeFailureDoesNotOpenRemote() async {
+        let lanEvents = ScriptedPreferredEventStream(scripts: [
+            .failure(NetworkError.unauthorized),
+        ])
+        let remoteEvents = ScriptedPreferredEventStream(scripts: [
+            .values([Data("unexpected".utf8)]),
+        ])
+        let route = PreferredRouterRoute(
+            lanHTTP: ScriptedPreferredHTTPClient(results: []),
+            lanEvents: lanEvents,
+            remoteHTTP: ScriptedPreferredHTTPClient(results: []),
+            remoteEvents: remoteEvents
+        )
+
+        do {
+            _ = try await Self.first(
+                PreferredRouterEventStream(route: route).events(
+                    path: "/api/v1/events",
+                    token: "token"
+                )
+            )
+            XCTFail("expected LAN authentication failure")
+        } catch {
+            XCTAssertEqual(error as? NetworkError, .unauthorized)
+        }
+
+        XCTAssertEqual(lanEvents.openCount, 1)
+        XCTAssertEqual(remoteEvents.openCount, 0)
+    }
+
+    private static func makeRoute(
+        lanError: Error,
+        remoteHTTP: ScriptedPreferredHTTPClient
+    ) -> PreferredRouterRoute {
+        PreferredRouterRoute(
+            lanHTTP: ScriptedPreferredHTTPClient(results: [.failure(lanError)]),
+            lanEvents: ScriptedPreferredEventStream(scripts: []),
+            remoteHTTP: remoteHTTP,
+            remoteEvents: ScriptedPreferredEventStream(scripts: [])
+        )
+    }
+
+    private static func okResponse(body: String = #"{"ok":true}"#) -> (Data, HTTPURLResponse) {
+        let response = HTTPURLResponse(
+            url: URL(string: "http://router.local:8377/api/v1/status")!,
+            statusCode: 200,
+            httpVersion: nil,
+            headerFields: nil
+        )!
+        return (Data(body.utf8), response)
+    }
+
+    private static func first(
+        _ stream: AsyncThrowingStream<Data, Error>
+    ) async throws -> Data {
+        for try await value in stream {
+            return value
+        }
+        throw NetworkError.streamEnded
+    }
+}
+
+private actor ScriptedPreferredHTTPClient: RouterHTTPClient {
+    private var results: [Result<(Data, HTTPURLResponse), Error>]
+    private(set) var callCount = 0
+
+    init(results: [Result<(Data, HTTPURLResponse), Error>]) {
+        self.results = results
+    }
+
+    func get(_ path: String, token: String) async throws -> (Data, HTTPURLResponse) {
+        try await request("GET", path, body: nil, token: token)
+    }
+
+    func request(
+        _ method: String,
+        _ path: String,
+        body: Data?,
+        token: String
+    ) async throws -> (Data, HTTPURLResponse) {
+        callCount += 1
+        guard !results.isEmpty else {
+            throw NetworkError.transport("unexpected HTTP request")
+        }
+        return try results.removeFirst().get()
+    }
+}
+
+private actor SuspendedPreferredHTTPClient: RouterHTTPClient {
+    private var firstRequestContinuation: CheckedContinuation<(Data, HTTPURLResponse), Error>?
+    private var pendingFirstRequestResult: Result<(Data, HTTPURLResponse), Error>?
+    private var firstRequestIsResolved = false
+    private var subsequentResults: [Result<(Data, HTTPURLResponse), Error>]
+    private(set) var callCount = 0
+
+    init(subsequentResults: [Result<(Data, HTTPURLResponse), Error>] = []) {
+        self.subsequentResults = subsequentResults
+    }
+
+    func get(_ path: String, token: String) async throws -> (Data, HTTPURLResponse) {
+        try await request("GET", path, body: nil, token: token)
+    }
+
+    func request(
+        _ method: String,
+        _ path: String,
+        body: Data?,
+        token: String
+    ) async throws -> (Data, HTTPURLResponse) {
+        callCount += 1
+        if callCount == 1 {
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    if let pendingFirstRequestResult {
+                        self.pendingFirstRequestResult = nil
+                        continuation.resume(with: pendingFirstRequestResult)
+                    } else if Task.isCancelled {
+                        firstRequestIsResolved = true
+                        continuation.resume(throwing: CancellationError())
+                    } else {
+                        firstRequestContinuation = continuation
+                    }
+                }
+            } onCancel: {
+                Task {
+                    await self.resumeFirstRequest(with: .failure(CancellationError()))
+                }
+            }
+        }
+        guard !subsequentResults.isEmpty else {
+            throw URLError(.cannotConnectToHost)
+        }
+        return try subsequentResults.removeFirst().get()
+    }
+
+    func waitUntilFirstRequestIsSuspended(
+        timeout: Duration = .seconds(2)
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while firstRequestContinuation == nil {
+            guard clock.now < deadline else {
+                throw SuspendedPreferredHTTPClientError.timedOut
+            }
+            try await clock.sleep(for: .milliseconds(10))
+        }
+    }
+
+    func resumeFirstRequest(
+        with result: Result<(Data, HTTPURLResponse), Error>
+    ) {
+        guard !firstRequestIsResolved else { return }
+        firstRequestIsResolved = true
+        if let firstRequestContinuation {
+            self.firstRequestContinuation = nil
+            firstRequestContinuation.resume(with: result)
+        } else {
+            pendingFirstRequestResult = result
+        }
+    }
+}
+
+private enum SuspendedPreferredHTTPClientError: Error {
+    case timedOut
+}
+
+private actor PreferredRouteTaskCompletionProbe {
+    private var isMarked = false
+
+    func mark() {
+        isMarked = true
+    }
+
+    func waitUntilMarked(timeout: Duration = .seconds(2)) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while !isMarked {
+            guard clock.now < deadline else {
+                throw SuspendedPreferredHTTPClientError.timedOut
+            }
+            try await clock.sleep(for: .milliseconds(10))
+        }
+    }
+}
+
+private final class ScriptedPreferredEventStream: RouterEventStream, @unchecked Sendable {
+    enum Script: @unchecked Sendable {
+        case values([Data])
+        case failure(Error)
+    }
+
+    private let lock = NSLock()
+    private var scripts: [Script]
+    private var opens = 0
+
+    init(scripts: [Script]) {
+        self.scripts = scripts
+    }
+
+    var openCount: Int { lock.withLock { opens } }
+
+    func events(path: String, token: String) -> AsyncThrowingStream<Data, Error> {
+        let script = lock.withLock { () -> Script in
+            opens += 1
+            guard !scripts.isEmpty else {
+                return .failure(NetworkError.transport("unexpected event stream open"))
+            }
+            return scripts.removeFirst()
+        }
+        return AsyncThrowingStream { continuation in
+            switch script {
+            case .values(let values):
+                for value in values {
+                    continuation.yield(value)
+                }
+                continuation.finish()
+            case .failure(let error):
+                continuation.finish(throwing: error)
+            }
+        }
+    }
+}
